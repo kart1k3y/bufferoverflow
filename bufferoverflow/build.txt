@@ -1,0 +1,1 @@
+cl /std:c++17 /EHsc /W3 server.cpp /Fe:server.exe

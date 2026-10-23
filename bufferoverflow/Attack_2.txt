@@ -1,0 +1,237 @@
+# Buffer Overflow Demo — Vector Object Corruption
+
+## Vulnerable server code
+
+The vulnerable operation occurs after normal authentication:
+
+```cpp
+if (std::strcmp(user.password, password.c_str()) == 0) {
+    std::memcpy(
+        user.privateinfo,
+        privateinfo.c_str(),
+        privateinfo.size()
+    );
+
+    res.set_content(private_page(user), "text/html");
+    return;
+}
+```
+
+`privateinfo` is stored in a fixed-size array:
+
+```cpp
+char privateinfo[256];
+```
+
+but the `memcpy()` length comes directly from:
+
+```cpp
+privateinfo.size()
+```
+
+There is no check that the supplied data fits inside the 256-byte destination.
+
+Therefore:
+
+```text
+destination capacity = 256 bytes
+copy length           = attacker-controlled
+```
+
+If the copy length exceeds 256 bytes, `memcpy()` continues writing past the end of `user.privateinfo`.
+
+---
+
+## Why `std::vector<User>` is relevant
+
+The users are stored in a:
+
+```cpp
+std::vector<User>
+```
+
+A vector stores its elements in a contiguous allocation.
+
+Conceptually, if several `User` objects are currently stored in the same allocation:
+
+```text
+vector storage
+
+┌───────────────────────────────┐
+│ User 0                        │
+│ ├ username[128]              │
+│ ├ password[32]                │
+│ └ privateinfo[256]            │
+├───────────────────────────────┤
+│ User 1                        │
+│ ├ username[128]              │
+│ ├ password[32]                │
+│ └ privateinfo[256]            │
+├───────────────────────────────┤
+│ User 2                        │
+│ ...                           │
+└───────────────────────────────┘
+```
+
+Consequently, an out-of-bounds write from the `privateinfo` member of one element can potentially reach bytes belonging to subsequent elements.
+
+**However, this layout should not be treated as guaranteed across arbitrary executions.** Vector reallocations, allocator behavior, object layout, and other implementation details affect the actual memory arrangement.
+
+This is why a debugger or memory sanitizer is useful for the demonstration.
+
+---
+
+## Test payload
+
+The browser-side test constructs a JavaScript string containing an embedded null byte:
+
+```js
+const a =
+    "13412\x003412341234123412341234123412341234123412341234123412341234123412341234123412341234123412341234123412341234123412341234123412341234123412341234123412341234123412341234123412341234123412341234123412341234123412341234123412341234123412341234123412341234"
+    + "hacked\x00xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx123\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00";
+```
+
+The payload is then sent to the local server:
+
+```js
+fetch("http://127.0.0.1:8080/updateinfo", {
+    headers: {
+        "content-type": "application/x-www-form-urlencoded"
+    },
+    body: "privateinfo=" + a + "&username=hacker&password=123",
+    method: "POST"
+});
+```
+
+The embedded `\x00` characters are significant because a C++ `std::string` can contain null bytes. `std::string::size()` counts them as part of the string length.
+
+This differs from `strlen()`, which stops at the first null byte.
+
+---
+
+## What happens during the vulnerable copy
+
+The server receives the `privateinfo` value as a `std::string`.
+
+It then executes:
+
+```cpp
+std::memcpy(
+    user.privateinfo,
+    privateinfo.c_str(),
+    privateinfo.size()
+);
+```
+
+`memcpy()` does not interpret the input as a C string.
+
+In particular, it does **not** stop at:
+
+```text
+00
+```
+
+It copies exactly the requested number of bytes.
+
+Therefore, if the input contains:
+
+```text
+[256 bytes fitting privateinfo]
+[additional bytes]
+```
+
+the additional bytes are written beyond:
+
+```text
+user.privateinfo[255]
+```
+
+The conceptual result is:
+
+```text
+Before:
+
+User N
+┌─────────────────────────────┐
+│ privateinfo[256]            │
+└─────────────────────────────┘
+
+User N+1
+┌─────────────────────────────┐
+│ username[128]               │
+├─────────────────────────────┤
+│ password[32]                │
+├─────────────────────────────┤
+│ privateinfo[256]            │
+└─────────────────────────────┘
+
+
+After an oversized copy:
+
+User N
+┌─────────────────────────────┐
+│ privateinfo[256]            │
+└─────────────────────────────┘
+             │
+             │ out-of-bounds write
+             ▼
+User N+1
+┌─────────────────────────────┐
+│ potentially corrupted data  │
+├─────────────────────────────┤
+│ potentially corrupted data  │
+├─────────────────────────────┤
+│ potentially corrupted data  │
+└─────────────────────────────┘
+```
+
+The important lesson is that **the memory-safety boundary is the 256-byte array, not the `std::string` containing the input**.
+
+---
+
+## Why this is a different bug from the password example
+
+The earlier demonstration targeted a neighboring `unsigned int`:
+
+```cpp
+char passwordcstr[32];
+unsigned int k;
+```
+
+The current demonstration instead targets the boundary of an object stored inside a contiguous container.
+
+The vulnerable primitive is simpler:
+
+```cpp
+std::memcpy(destination, input, input.size());
+```
+
+The destination has a fixed capacity, while the source length is attacker-controlled.
+
+---
+
+## The security lesson
+
+The correct implementation must establish a maximum before performing the copy.
+
+For a 256-byte field, the server must ensure the number of bytes copied cannot exceed the destination capacity.
+
+For example, conceptually:
+
+```text
+input length
+     │
+     ▼
+┌─────────────┐
+│ <= 256 ?    │
+└──────┬──────┘
+       │
+   yes │ no
+       │  └── reject request
+       ▼
+    memcpy
+```
+
+The fundamental problem is therefore **an unchecked out-of-bounds write**.
+
+The fact that the application happens to use `std::vector<User>` makes the consequences interesting for a demonstration, because vector elements are contiguous, but relying on a particular neighboring user's data being immediately after the overflowing object is not a portable C++ assumption.

